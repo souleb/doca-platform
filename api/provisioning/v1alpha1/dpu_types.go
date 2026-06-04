@@ -94,6 +94,7 @@ const (
 	DPUCondOSInstalled            DPUConditionType = "OSInstalled"
 	DPUConditionHostPowerCycle    DPUConditionType = "HostPowerCycle"
 	DPUCondRebooted               DPUConditionType = "Rebooted"
+	DPUCondDPUConfig              DPUConditionType = "DPUConfig"
 	DPUCondHostNetworkReady       DPUConditionType = "HostNetworkReady"
 	DPUCondDPUClusterReady        DPUConditionType = "DPUClusterReady"
 	DPUCondNodeEffectRemoved      DPUConditionType = "NodeEffectRemoved"
