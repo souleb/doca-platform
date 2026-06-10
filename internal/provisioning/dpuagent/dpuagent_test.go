@@ -34,7 +34,120 @@ import (
 const testRetryInterval = 1 * time.Millisecond
 
 var _ = Describe("DPUAgent", func() {
+	Describe("Done marker", func() {
+		It("should write the done marker file after all operations complete successfully", func() {
+			markerCalled := false
+
+			agent := &DPUAgent{
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: func(_ string) error { markerCalled = true; return nil },
+				optCtx: &operations.Context{
+					Client: &mockClient{},
+				},
+				operations: []operations.Operation{
+					&mockOperation{name: "op1", conditionType: "Op1Condition", executeFunc: func(_ context.Context, _ *operations.Context) error { return nil }},
+				},
+			}
+			Expect(agent.Run(ctx)).To(Succeed())
+			Expect(markerCalled).To(BeTrue())
+		})
+
+		It("should not write the done marker when the run is aborted", func() {
+			cancelCtx, cancelFunc := context.WithCancel(ctx)
+			markerCalled := false
+
+			agent := &DPUAgent{
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: func(_ string) error { markerCalled = true; return nil },
+				optCtx: &operations.Context{
+					Client: &mockClient{},
+				},
+				operations: []operations.Operation{
+					&mockOperation{name: "cancel-op", conditionType: "CancelOpCondition", executeFunc: func(_ context.Context, _ *operations.Context) error {
+						cancelFunc()
+						return fmt.Errorf("error that triggers context check")
+					}},
+				},
+			}
+			err := agent.Run(cancelCtx)
+			Expect(err).To(HaveOccurred())
+			Expect(markerCalled).To(BeFalse())
+		})
+
+		It("should remove a stale done marker at startup before operations run", func() {
+			removeCalled := false
+			opExecuted := false
+
+			agent := &DPUAgent{
+				retryInterval:        testRetryInterval,
+				removeDoneMarkerFunc: func(_ string) error { removeCalled = true; return nil },
+				writeDoneMarkerFunc:  func(_ string) error { return nil },
+				optCtx: &operations.Context{
+					Client: &mockClient{},
+				},
+				operations: []operations.Operation{
+					&mockOperation{name: "op1", conditionType: "Op1Condition", executeFunc: func(_ context.Context, _ *operations.Context) error {
+						Expect(removeCalled).To(BeTrue(), "stale marker should be removed before operations run")
+						opExecuted = true
+						return nil
+					}},
+				},
+			}
+			Expect(agent.Run(ctx)).To(Succeed())
+			Expect(opExecuted).To(BeTrue())
+		})
+
+		It("should return error when removing the stale done marker fails", func() {
+			agent := &DPUAgent{
+				retryInterval:        testRetryInterval,
+				removeDoneMarkerFunc: func(_ string) error { return fmt.Errorf("permission denied") },
+				writeDoneMarkerFunc:  func(_ string) error { return nil },
+				optCtx: &operations.Context{
+					Client: &mockClient{},
+				},
+				operations: []operations.Operation{
+					&mockOperation{name: "op1", conditionType: "Op1Condition", executeFunc: func(_ context.Context, _ *operations.Context) error { return nil }},
+				},
+			}
+			err := agent.Run(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("stale done marker"))
+		})
+
+		It("should return error when writing the done marker fails", func() {
+			agent := &DPUAgent{
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: func(_ string) error { return fmt.Errorf("disk full") },
+				optCtx: &operations.Context{
+					Client: &mockClient{},
+				},
+				operations: []operations.Operation{
+					&mockOperation{name: "op1", conditionType: "Op1Condition", executeFunc: func(_ context.Context, _ *operations.Context) error { return nil }},
+				},
+			}
+			err := agent.Run(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("done marker"))
+		})
+	})
+
 	Describe("Run", func() {
+		noopMarker := func(_ string) error { return nil }
+
+		It("should include package installation after static file verification", func() {
+			agent := NewDPUAgent(&operations.Context{})
+			names := make([]string, 0, len(agent.operations))
+			for _, op := range agent.operations {
+				names = append(names, op.Name())
+			}
+
+			Expect(names).To(ContainElement("Verify Static Files"))
+			Expect(names).To(ContainElement("Install Packages"))
+			Expect(names).To(ContainElement("Handle Reboot"))
+			Expect(indexOf(names, "Verify Static Files")).To(BeNumerically("<", indexOf(names, "Install Packages")))
+			Expect(indexOf(names, "Install Packages")).To(BeNumerically("<", indexOf(names, "Handle Reboot")))
+		})
+
 		It("should execute operations in order", func() {
 			executionOrder := []string{}
 			mockOps := []operations.Operation{
@@ -65,7 +178,8 @@ var _ = Describe("DPUAgent", func() {
 			}
 
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -90,7 +204,8 @@ var _ = Describe("DPUAgent", func() {
 				},
 			}
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -114,7 +229,8 @@ var _ = Describe("DPUAgent", func() {
 				},
 			}
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -127,10 +243,9 @@ var _ = Describe("DPUAgent", func() {
 		It("sets RebootMethodDiscovery true when rebootMethodDiscoveryFunc returns true", func() {
 			var discovery bool
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
-				rebootMethodDiscoveryFunc: func(context.Context) bool {
-					return true
-				},
+				retryInterval:             testRetryInterval,
+				writeDoneMarkerFunc:       noopMarker,
+				rebootMethodDiscoveryFunc: func(context.Context) bool { return true },
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -152,10 +267,9 @@ var _ = Describe("DPUAgent", func() {
 		It("sets RebootMethodDiscovery false when SkipRebootMethodDiscovery is true", func() {
 			var discovery bool
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
-				rebootMethodDiscoveryFunc: func(context.Context) bool {
-					return true
-				},
+				retryInterval:             testRetryInterval,
+				writeDoneMarkerFunc:       noopMarker,
+				rebootMethodDiscoveryFunc: func(context.Context) bool { return true },
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 					Options: opts.Options{
@@ -208,7 +322,8 @@ var _ = Describe("DPUAgent", func() {
 			}
 
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -237,7 +352,8 @@ var _ = Describe("DPUAgent", func() {
 			}
 
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -252,7 +368,8 @@ var _ = Describe("DPUAgent", func() {
 		It("uses CondMessage for the success condition message", func() {
 			const condType = "Op1Condition"
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -279,7 +396,8 @@ var _ = Describe("DPUAgent", func() {
 			attempts := 0
 			seen := []string{}
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -313,7 +431,8 @@ var _ = Describe("DPUAgent", func() {
 			const secondCond = "SecondCondition"
 			secondSeen := "unset"
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -376,7 +495,8 @@ var _ = Describe("DPUAgent", func() {
 			}
 
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{
 						updateStatusFunc: func(ctx context.Context, status provisioningv1.AgentStatus) error {
@@ -403,7 +523,8 @@ var _ = Describe("DPUAgent", func() {
 			secondOpExecuted := false
 
 			agent := &DPUAgent{
-				retryInterval: testRetryInterval,
+				retryInterval:       testRetryInterval,
+				writeDoneMarkerFunc: noopMarker,
 				optCtx: &operations.Context{
 					Client: &mockClient{},
 				},
@@ -496,4 +617,13 @@ func (m *mockClient) HealthCheck() error {
 		return m.healthCheckFunc()
 	}
 	return nil
+}
+
+func indexOf(values []string, target string) int {
+	for i, value := range values {
+		if value == target {
+			return i
+		}
+	}
+	return -1
 }
